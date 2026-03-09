@@ -1,0 +1,122 @@
+MedScraper Security Hardening Plan
+==================================
+
+1) Server-Side Request Forgery (SSRF) Mitigation  [DONE, app-level]
+-------------------------------------------------------------------
+- `ScrapeRequest.url` is validated in `backend/main.py` via `_validate_public_http_url`.
+- Only http/https URLs with a hostname are allowed (no bare IPs or other schemes).
+- DNS resolution is performed and any target resolving to private, loopback, or link-local
+  IP ranges is rejected:
+  - 127.0.0.0/8
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 169.254.0.0/16
+- **Still recommended**: enforce similar egress rules at the infrastructure layer
+  (firewall / security group) in any hosted deployment.
+
+
+2) CORS Tightening  [DONE, configurable]
+----------------------------------------
+- In `backend/main.py`, CORS is now restricted to a specific list of origins:
+  - Defaults to `http://localhost:5173` and `http://127.0.0.1:5173`.
+  - Can be overridden via the `MEDSCRAPER_CORS_ORIGINS` environment variable
+    (comma-separated list).
+- `allow_credentials` is set to `False` because the app does not rely on cookies or
+  browser auth headers.
+
+
+3) Authentication and Authorization  [PARTIALLY DONE]
+-----------------------------------------------------
+- A simple **API key** guard has been added:
+  - `MEDSCRAPER_API_KEY` environment variable configures the key.
+  - Protected endpoints require an `X-API-Key` header matching this value.
+  - If `MEDSCRAPER_API_KEY` is unset/empty, the guard is effectively disabled
+    (convenient for local single-user usage).
+- Currently, the guard is applied to:
+  - POST /api/scrape
+  - GET /api/jobs
+  - GET /api/jobs/{job_id}
+  - GET /api/jobs/{job_id}/doctors
+  - GET /api/doctors
+  - GET /api/jobs/{job_id}/download
+  - DELETE /api/jobs/{job_id}
+- `/api/health` remains unauthenticated.
+- **Future enhancements (pending)**:
+  - Stronger auth schemes for multi-user scenarios (OAuth2 / JWT, or reverse-proxy auth).
+  - Multi-tenant ownership fields on `JobModel` and `DoctorModel`, with per-user filtering.
+
+
+4) Error Message Sanitization  [DONE]
+-------------------------------------
+- In `backend/main.py`, `run_scrape_job` now sets:
+  - `job.error = "Scrape failed due to an internal error."`
+  on failure, while logging the full exception text into the job log.
+- This ensures that `JobResponse.error` contains only a generic message, not
+  stack traces, filesystem paths, or library internals.
+
+
+5) Rate Limiting and Quotas
+---------------------------
+- Add rate limiting on:
+  - POST /api/scrape
+  - Potentially GET /api/doctors and GET /api/jobs
+- If using a reverse proxy (nginx, Envoy, etc.), configure per-IP limits.
+- Optionally enforce per-user quotas at the application layer:
+  - Maximum concurrent running jobs per user.
+  - Maximum jobs per day per user.
+
+
+6) Sandboxing the Crawler and Playwright
+----------------------------------------
+- Run the scraping worker (including Playwright) inside a dedicated,
+  heavily restricted container/VM:
+  - No access to host filesystem beyond what is strictly required.
+  - No privileged capabilities.
+  - Outbound network restricted to the allowed domains/ranges.
+- Separate this worker from the main API process so that compromise of
+  the headless browser is isolated.
+
+
+7) Response Size and Resource Limits
+------------------------------------
+- Add HTTP client safeguards to the crawler:
+  - Limit maximum response size (e.g. a few MB) using httpx limits or streaming.
+  - Enforce timeouts (already in place) and consider a global per-job time budget.
+- Add safeguards around HTML/JSON-LD parsing:
+  - Optionally reject pages larger than a configured byte threshold.
+  - Consider short-circuiting parsing if the document is clearly too large
+    or complex to be worth processing.
+
+
+8) Data Exposure and Storage  [PARTIALLY DONE]
+----------------------------------------------
+- The `outputs/` directory (CSV files and SQLite DB) is **not** exposed by the
+  FastAPI app and is intended for local filesystem access only.
+- `.gitignore` excludes:
+  - `outputs/`
+  - `*.csv`
+  - `scraper.db`
+  ensuring scraped data is not accidentally committed to version control.
+- If exposing this system beyond a single trusted environment:
+  - Ensure `outputs/` is never served by any reverse proxy or static file server.
+  - Reconsider exposing `/api/doctors` as a global search endpoint without
+    stronger auth/authorization and tenant isolation.
+
+
+9) Logging and Monitoring
+-------------------------
+- Centralize logs (e.g. to stdout or a logging service) and ensure they
+  include enough context to debug without exposing sensitive data.
+- Add basic monitoring/alerts for:
+  - Unusual spikes in job creation.
+  - Persistent scrape failures (which might indicate blocking or abuse).
+
+
+10) Future Hardening Ideas
+--------------------------
+- Add CSRF protection if you later introduce cookie-based auth and a browser UI.
+- Consider input validation on query parameters for `/api/doctors`
+  (length limits, character allowlists) to reduce log noise and possible DoS vectors.
+- Add unit/integration tests that exercise the URL validation and SSRF protections.
+
